@@ -47,6 +47,16 @@ add_action('rest_api_init', function () {
         'callback' => 'faap_handle_submission',
         'permission_callback' => '__return_true',
     ));
+    register_rest_route('faap/v1', '/applications', array(
+        'methods' => 'GET',
+        'callback' => 'faap_get_applications',
+        'permission_callback' => '__return_true',
+    ));
+    register_rest_route('faap/v1', '/applications/(?P<id>\d+)/payment-verified', array(
+        'methods' => 'POST',
+        'callback' => 'faap_verify_payment',
+        'permission_callback' => '__return_true',
+    ));
 });
 
 function faap_get_form_config($data) {
@@ -73,6 +83,7 @@ function faap_handle_submission($request) {
     // 2. Extract AI generated Email Content
     $email_subject = $params['emailSubject'] ?? 'Application Received - Prominence Bank';
     $email_body = $params['emailBody'] ?? '';
+    $application_id = $params['applicationId'] ?? 'N/A';
     
     // 3. Find User Email
     $user_email = '';
@@ -87,15 +98,79 @@ function faap_handle_submission($request) {
         $headers = array('Content-Type: text/html; charset=UTF-8');
         $admin_email = get_option('admin_email');
 
+        // Modify email body to include Application ID
+        $user_email_body = str_replace('Application Reference ID', 'Application Reference ID: ' . $application_id, $email_body);
+        $admin_email_body = $user_email_body . '<br><br><strong>Admin Note:</strong> New application submitted. Application ID: ' . $application_id;
+
         // Send to User
-        wp_mail($user_email, $email_subject, $email_body, $headers);
+        wp_mail($user_email, $email_subject, $user_email_body, $headers);
         
         // Send to Admin
-        $admin_subject = "NEW SUBMISSION: " . $email_subject;
-        wp_mail($admin_email, $admin_subject, $email_body, $headers);
+        $admin_subject = "NEW SUBMISSION - ID: " . $application_id . " - " . $email_subject;
+        wp_mail($admin_email, $admin_subject, $admin_email_body, $headers);
     }
 
-    return $result ? ['success' => true, 'id' => $wpdb->insert_id] : new WP_Error('db_err', 'Failed to save');
+    return $result ? ['success' => true, 'id' => $wpdb->insert_id, 'applicationId' => $application_id] : new WP_Error('db_err', 'Failed to save');
+}
+
+function faap_get_applications() {
+    global $wpdb;
+    $table_apps = $wpdb->prefix . 'faap_submissions';
+    
+    $applications = $wpdb->get_results("SELECT * FROM $table_apps ORDER BY submitted_at DESC", ARRAY_A);
+    
+    // Format the data for the admin dashboard
+    $formatted_apps = array_map(function($app) {
+        $form_data = json_decode($app['form_data'], true);
+        return [
+            'id' => $app['id'],
+            'type' => $app['type'],
+            'accountTypeId' => $app['account_type_id'],
+            'status' => $app['status'],
+            'submittedAt' => $app['submitted_at'],
+            'applicationId' => $form_data['applicationId'] ?? 'N/A',
+            'formData' => $form_data
+        ];
+    }, $applications);
+    
+    return $formatted_apps;
+}
+
+function faap_verify_payment($request) {
+    global $wpdb;
+    $app_id = $request->get_param('id');
+    $table_apps = $wpdb->prefix . 'faap_submissions';
+    
+    // Update status to verified
+    $result = $wpdb->update($table_apps, ['status' => 'Payment Verified'], ['id' => $app_id]);
+    
+    if ($result) {
+        // Get application data for email
+        $app = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_apps WHERE id = %d", $app_id), ARRAY_A);
+        $form_data = json_decode($app['form_data'], true);
+        $application_id = $form_data['applicationId'] ?? 'N/A';
+        $user_email = $form_data['email'] ?? $form_data['signatoryEmail'] ?? '';
+        
+        // Send notification emails
+        if (!empty($user_email)) {
+            $headers = array('Content-Type: text/html; charset=UTF-8');
+            $admin_email = get_option('admin_email');
+            
+            // Email to user
+            $user_subject = "Payment Verified - Application ID: " . $application_id;
+            $user_body = "Dear Customer,<br><br>Your payment has been verified for Application ID: <strong>" . $application_id . "</strong>.<br><br>Your application is now being processed.<br><br>Best regards,<br>Prominence Bank Team";
+            wp_mail($user_email, $user_subject, $user_body, $headers);
+            
+            // Email to admin
+            $admin_subject = "PAYMENT VERIFIED - Application ID: " . $application_id;
+            $admin_body = "Payment has been verified for Application ID: <strong>" . $application_id . "</strong>.<br><br>Application is ready for final processing.";
+            wp_mail($admin_email, $admin_subject, $admin_body, $headers);
+        }
+        
+        return ['success' => true, 'message' => 'Payment verified successfully'];
+    }
+    
+    return new WP_Error('update_err', 'Failed to verify payment');
 }
 
 // 3. Admin Menu
